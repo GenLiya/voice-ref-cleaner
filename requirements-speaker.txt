@@ -1,0 +1,9 @@
+# 可选：说话人分离（把主持人 / 画外音和目标说话人分开）
+# 用 ModelScope 的 CAM++ 中文说话人确认模型
+#   出处：https://github.com/modelscope/3D-Speaker (Apache-2.0)
+#   权重：iic/speech_campplus_sv_zh-cn_16k-common
+#
+# 不装也能用：加 --no-speaker 就只做「去 BGM + 去音效」。
+modelscope>=1.20
+addict
+datasets<4
