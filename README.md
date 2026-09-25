@@ -145,4 +145,18 @@ Demucs 的结果会缓存在 `out/demucs/`，**反复调参不会重跑分离**�
 ## License
 
 MIT（本项目自身代码）。**上游组件各自遵循其原有许可**：Demucs(MIT)、Silero VAD(MIT)、
-3D-Speaker / CAM++(Apache-2.0)。使用前请一并遵守。
+3D-Speaker / CAM++(Apache-2.0)。使用前请一并遵守。逐项出处见 [`THIRD_PARTY.md`](THIRD_PARTY.md)。
+
+---
+
+## 附：`git push` 用不了的时候
+
+如果你所在网络能通 `api.github.com` 但 `github.com:443` 直连超时 / Connection reset
+（`git push` 会报 `Failed to connect to github.com port 443`），仓库里带了个绕过办法：
+
+```bash
+node tools/push_via_api.mjs <owner>/<repo> [目录] [提交信息]
+```
+
+它走 GitHub 的 Git Data API，把目录里所有文件做成**一个提交**；磁盘上没有、仓库里有的文件会被删除。
+令牌从 `gh auth token` 取，不打印、不落盘。（本项目的 README 就是这么推上去的。）
