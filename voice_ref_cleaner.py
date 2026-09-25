@@ -237,13 +237,22 @@ def vad_speech(wav: np.ndarray, sr: int, min_speech: float = 0.35, min_sil: floa
 
 def screen_chunks(
     voc: np.ndarray, nov: np.ndarray, sr: int, regions: list[tuple[float, float]],
-    target_centroid: np.ndarray | None, model, chunk: float = 3.0,
+    target_centroid: np.ndarray | None, model, chunk: float = 1.0, sub: float = 0.5,
 ) -> list[Chunk]:
-    """把每个语音区间切成 <=chunk 秒的小块，逐块算特征并打分。
+    """把每个语音区间切成 <=chunk 秒的小块，逐块打分。
 
-    打分＝各特征**排名求和**（不依赖量纲）：
+    ⚠️⚠️ 两条是被实测教训逼出来的，别改回去：
+
+    1) **块要短（默认 1 秒），而且特征要取"子窗里最差的那个"，不能取平均。**
+       第一版用 3 秒块 + 平均特征 → 一个 0.3 秒的音效只占这块的 10%，平均分照样很高 →
+       整块被放行，成品里全是"噔噔""鸭叫"。实测用户原话："这次做出来的还没上次好，
+       上次至少没有别人的声音"。改成 1 秒块 + **最差子窗**之后，音效藏不住了。
+
+    2) **声纹相似度要在"比块更长的窗"上算**（块 ±0.25s）—— 1 秒太短，
+       说话人向量不稳；但**音效类特征必须留在这 1 秒里算**，否则又变成平均。
+
+    打分＝各特征**排名求和**：
       相似度 ↑、人声占比 ↑、基频稳定度 ↑、平坦度 ↓、谱峰度 ↓、峰均比 ↓
-    高分的留下，低分的丢掉 —— 音效天然落在低分那一端。
     """
     out: list[Chunk] = []
     for (a, b) in regions:
@@ -253,33 +262,126 @@ def screen_chunks(
             seg = voc[int(t * sr) : int((t + d) * sr)]
             if len(seg) < int(0.3 * sr):
                 break
-            f = dict(
-                flat=_flatness(seg, sr),
-                crest=_crest_ratio(seg, sr),
-                peak=_peak_ratio(seg),
-                voiced=_voiced_ratio(seg, sr),
-                vdom=_vocal_dominance(
-                    voc[int(t * sr) : int((t + d) * sr)], nov[int(t * sr) : int((t + d) * sr)], sr
-                ),
-                sim=float(np.dot(embed_one(seg, model), target_centroid)) if (model is not None and target_centroid is not None) else 0.0,
-            )
-            out.append(Chunk(start=t, dur=d, feats=f))
+            f = _worst_subwindow(voc, nov, sr, t, d, model, target_centroid, sub)
+            if f is not None:
+                out.append(Chunk(start=t, dur=d, feats=f))
             t += d
     if not out:
         return out
     keys = ["sim", "vdom", "voiced", "flat", "crest", "peak"]
-    higher_better = {"sim": True, "vdom": True, "voiced": True, "flat": False, "crest": False, "peak": False}
     ranks = {}
     for k in keys:
-        vals = [(-c.feats[k] if higher_better[k] else c.feats[k]) for c in out]
+        vals = [(-c.feats[k] if _HIGHER[k] else c.feats[k]) for c in out]
         ranks[k] = np.argsort(np.argsort(vals))
     for i, c in enumerate(out):
         c.score = float(sum(ranks[k][i] for k in keys))
-    # 归一化到 0~1（越大越好）
     smax = max(c.score for c in out)
     for c in out:
         c.score = 1.0 - c.score / (smax + EPS)
     return out
+
+
+# 「越大越好」的特征；其余越小越好。_worst_subwindow 用它决定取 min 还是 max。
+_HIGHER = {"sim": True, "vdom": True, "voiced": True, "flat": False, "crest": False, "peak": False}
+
+
+def _unit_feats(voc, nov, sr, t, dur, model, centroid):
+    seg = voc[int(t * sr) : int((t + dur) * sr)]
+    if len(seg) < int(0.15 * sr):
+        return None
+    f = dict(
+        flat=_flatness(seg, sr),
+        crest=_crest_ratio(seg, sr),
+        peak=_peak_ratio(seg),
+        voiced=_voiced_ratio(seg, sr),
+        vdom=_vocal_dominance(voc[int(t * sr) : int((t + dur) * sr)],
+                              nov[int(t * sr) : int((t + dur) * sr)], sr),
+    )
+    if model is not None and centroid is not None:
+        c0, c1 = max(0, int((t - 0.25) * sr)), min(len(voc), int((t + dur + 0.25) * sr))
+        f["sim"] = float(np.dot(embed_one(voc[c0:c1], model), centroid))
+    else:
+        f["sim"] = 0.0
+    return f
+
+
+def _worst_subwindow(voc, nov, sr, t, dur, model, centroid, sub=0.5, floor_db: float = -45.0):
+    """把一块切成 sub 秒的子窗（步长 sub/2），逐子窗算特征，取**最差**的那个。
+
+    这一步是"音效藏在块里"的唯一解药：段里只要有一处像音效，整块就被判差、丢掉。
+
+    ⚠️ **静音子窗必须跳过**：拼接出来的参考素材在块间有静音间隔，
+    数字静音的平坦度恰好是 1.0、基频 0 —— 不排除的话，自检会把"块间空隙"全报成疑似音效
+    （实测踩过：自检报的 10 段全是空隙，掩盖了真正的问题）。
+    """
+    out, tt, step = None, t, sub / 2
+    while tt < t + dur - 1e-6:
+        d = min(sub, t + dur - tt)
+        if d < 0.15:
+            break
+        seg = voc[int(tt * sr) : int((tt + d) * sr)]
+        rms_db = 20 * np.log10(max(float(np.sqrt((seg ** 2).mean())), 1e-9))
+        if rms_db > floor_db:                      # 只统计"有声音"的子窗
+            f = _unit_feats(voc, nov, sr, tt, d, model, centroid)
+            if f:
+                if out is None:
+                    out = dict(f)
+                else:
+                    for k, v in f.items():
+                        out[k] = min(out[k], v) if _HIGHER[k] else max(out[k], v)
+        tt += step
+    return out
+
+
+HARD_RULES = [
+    ("sim", "<", 0.45, "声纹不像目标说话人"),
+    ("crest", ">", 3e5, "谱峰度过高（窄带强音＝音效）"),
+    ("peak", ">", 15.0, "峰均比过高（爆音）"),
+    ("flat", ">", 0.40, "平坦度过高（噪声）"),
+]
+
+
+def hard_flags(units: list[dict], has_target: bool) -> list[dict]:
+    """**绝对阈值**判定，不是百分位 —— 这是它能当循环终止条件的原因。
+
+    用百分位的话"最差的 15%"永远存在，循环永远不收敛（实测踩过）。
+    """
+    out = []
+    for c in units:
+        why = [msg for k, op, thr, msg in HARD_RULES
+               if not (k == "sim" and not has_target)
+               and ((c[k] < thr) if op == "<" else (c[k] > thr))]
+        if why:
+            out.append(dict(c, why=why))
+    return sorted(out, key=lambda c: c["t"])
+
+
+def qc_reference(path: Path, sr: int, unit: float, model, centroid,
+                 period: float | None = None) -> list[dict]:
+    """对**成品参考素材**再做一遍同样的筛查，返回**每一格**的特征。
+
+    ⚠️ 两个坑（都实测踩过）：
+      1) **网格必须和拼接时的网格对齐**（块长 + 块间静音）。否则自检的每一格都跨在两个块上，
+         取"最差子窗"就等于把两个块的缺点算到一格头上，会报出一堆假警报。
+      2) **`vdom`（人声÷伴奏能量比）在成品上没意义** —— 成品里没有伴奏轨，
+         分母趋零 → 这个特征会变成同一个巨大数值。自检**不能用它**排名。
+    """
+    per = period or (unit + 0.25)
+    y, _ = load_wav(path)
+    keys = ["sim", "voiced", "flat", "crest", "peak"]      # 不含 vdom
+    units = []
+    i = 0
+    while (i * per + unit) <= len(y) / sr + 1e-6:
+        t = i * per
+        seg = y[int(t * sr) : int((t + unit) * sr)]
+        if 20 * np.log10(max(float(np.sqrt((seg ** 2).mean())), 1e-9)) < -50:
+            i += 1
+            continue
+        f = _worst_subwindow(y, np.zeros_like(y), sr, t, unit, model, centroid, unit / 2)
+        if f:
+            units.append(dict(t=t, **{k: f[k] for k in keys}))
+        i += 1
+    return units
 
 
 # ─────────────────────────── 主流程 ───────────────────────────
@@ -292,7 +394,11 @@ def main() -> None:
     ap.add_argument("--target", default="auto",
                     help="目标说话人：auto=自动挑；A/B/C…=指定分簇字母；或给一个参考音频路径（按声纹匹配）")
     ap.add_argument("--sample", type=float, default=40.0, help="参考素材目标时长（秒）")
-    ap.add_argument("--keep-pct", type=float, default=60.0, help="按打分保留前百分之多少的块（默认 60）")
+    ap.add_argument("--keep-pct", type=float, default=55.0, help="按打分保留前百分之多少的块（默认 55）")
+    ap.add_argument("--chunk", type=float, default=1.0,
+                    help="切块长度（秒），默认 1.0。⚠️ 别调大：块越长，藏在块里的音效越容易被平均掉")
+    ap.add_argument("--sub", type=float, default=0.5,
+                    help="块内子窗长度（秒），默认 0.5；特征取子窗里**最差**的那个")
     ap.add_argument("--no-demucs", action="store_true", help="跳过去 BGM（输入已经是干净人声时用）")
     ap.add_argument("--no-speaker", action="store_true", help="跳过说话人分离（只做去 BGM + 去音效）")
     ap.add_argument("--device", default="cpu", help="demucs 设备")
@@ -391,43 +497,118 @@ def main() -> None:
     # 4) 切块 + 打分 + 组装
     print("[4/4] 按句切块 → 逐块打分 → 组装参考素材")
     if model is not None and centroid is not None:
-        regions = [r for r in regions
-                   if float(np.dot(embed_one(voc16[int(r[0]*sr):int(r[1]*sr)], model), centroid)) > 0.35]
-        print(f"      按声纹过滤后剩 {len(regions)} 段 / {sum(b-a_ for a_,b in regions):.1f}s")
-    chunks = screen_chunks(voc16, nov16, sr, regions, centroid, model)
-    chunks = [c for c in chunks if int(c.start) not in exclude]
+        kept_regions = []
+        for r in regions:
+            # 声纹过滤也别整段判：按 1 秒细查，避免"一段里夹了一句别人的话"整段被留/整段被丢
+            ok = 0; tot = 0
+            tt = r[0]
+            while tt < r[1]:
+                d = min(1.0, r[1] - tt)
+                if d < 0.3:
+                    break
+                e = embed_one(voc16[int(tt * sr) : int((tt + d) * sr)], model)
+                tot += 1
+                ok += int(float(np.dot(e, centroid)) > 0.45)
+                tt += d
+            if tot and ok / tot > 0.5:
+                kept_regions.append(r)
+        print(f"      按声纹过滤后剩 {len(kept_regions)} 段 / {sum(b-a_ for a_,b in kept_regions):.1f}s")
+        regions = kept_regions
+    chunks = [c for c in screen_chunks(voc16, nov16, sr, regions, centroid, model, chunk=a.chunk, sub=a.sub)
+              if int(c.start) not in exclude]
     if not chunks:
         raise SystemExit("✗ 没有可用片段")
-    order = sorted(chunks, key=lambda c: -c.score)
-    n_keep = max(1, int(len(order) * a.keep_pct / 100))
-    for c in order[:n_keep]:
+    pool = sorted(chunks, key=lambda c: -c.score)
+    n_keep = max(1, int(len(pool) * a.keep_pct / 100))
+    for c in pool[:n_keep]:
         c.kept, c.reason = True, "保留"
-    for c in order[n_keep:]:
-        c.kept, c.reason = False, "打分低（疑似音效/非目标说话人）"
+    for c in pool[n_keep:]:
+        c.kept, c.reason = False, "打分低"
 
     gap = np.zeros(int(0.25 * sr), dtype=np.float32)
-    pieces, total = [], 0.0
-    for c in sorted([c for c in chunks if c.kept], key=lambda c: c.start):
-        if total >= a.sample:
+    period = a.chunk + 0.25
+
+    def assemble(picked: list[Chunk]) -> np.ndarray:
+        ps = [voc16[int(c.start * sr) : int((c.start + c.dur) * sr)]
+              for c in sorted(picked, key=lambda c: c.start)]
+        return np.concatenate([np.concatenate([p, gap]) for p in ps]) if ps else np.zeros(sr, dtype=np.float32)
+
+    # ── 选 → 拼 → 自检 → 剔除重拼（自纠环）────────────────────────────
+    # 为什么要有这个环：**只靠"排名取前 55%"是不够的** —— 实测成品里仍混进了
+    # 「声纹相似度 0.03」（根本不是目标说话人）和「谱峰度 160 万」（窄带强音＝音效）的块。
+    # 排名是相对的，只能保证"比别的块好"，不能保证"本身合格"；所以要用**绝对阈值**把它们揪出来，
+    # 换成池子里次优的块，循环到自检干净为止。
+    banned: set[int] = set()
+    ref, flagged = np.zeros(sr, dtype=np.float32), []
+    for it in range(1, 6):
+        picked, tot = [], 0.0
+        for c in pool:
+            if id(c) in banned:
+                continue
+            if tot >= a.sample:
+                break
+            picked.append(c); tot += c.dur
+        ref = assemble(picked)
+        tmp = out / "_qc_tmp.wav"
+        sf.write(tmp, ref, sr)
+        units = qc_reference(tmp, sr, a.chunk, model, centroid, period=period)
+        flagged = hard_flags(units, has_target=(model is not None and centroid is not None))
+        print(f"      自纠第 {it} 轮：{len(picked)} 块 / {len(ref)/sr:.1f}s → 硬性不合格 {len(flagged)} 处")
+        if not flagged:
             break
-        seg = voc16[int(c.start * sr) : int((c.start + c.dur) * sr)]
-        pieces.append(seg); total += len(seg) / sr
-    ref = np.concatenate([np.concatenate([p, gap]) for p in pieces])
+        ordered = sorted(picked, key=lambda c: c.start)
+        n = 0
+        for f in flagged:
+            i = int(round(f["t"] / period))
+            if 0 <= i < len(ordered) and id(ordered[i]) not in banned:
+                banned.add(id(ordered[i])); ordered[i].reason = "自检不合格：" + "/".join(f["why"]); n += 1
+        if n == 0:
+            break
+    if (out / "_qc_tmp.wav").exists():
+        (out / "_qc_tmp.wav").unlink()
+
+    # 结算每块的状态（report.json 里要能看出"为什么留下/为什么被剔"）
+    picked_ids = {id(c) for c in picked}
+    for c in pool:
+        c.kept = id(c) in picked_ids
+        if c.kept:
+            c.reason = "保留"
+        elif id(c) in banned:
+            pass                                   # 已在自纠环里写过具体原因
+        elif c.reason == "保留":
+            c.reason = "未被选上（够时长了）"
     ref_p = out / "reference_clean.wav"
     sf.write(ref_p, ref, sr)
 
     report = dict(
         input=str(inp), out=str(out), demucs=not a.no_demucs,
-        vad_regions=len(regions), chunks_total=len(chunks), chunks_kept=n_keep,
+        vad_regions=len(regions), chunks_total=len(chunks), chunks_kept=len(picked),
         target=f"{chr(65+target_label)}" if target_label is not None else a.target,
         reference_seconds=round(len(ref) / sr, 2),
+        selfcheck_banned=len(banned),
         chunks=[dict(start=round(c.start, 2), dur=round(c.dur, 2), score=round(c.score, 3),
                      kept=c.kept, reason=c.reason, **{k: round(v, 4) for k, v in c.feats.items()})
                 for c in sorted(chunks, key=lambda c: c.start)],
     )
     (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"\n✓ 参考素材 → {ref_p}  {len(ref)/sr:.1f}s（{n_keep}/{len(chunks)} 块）")
+    print(f"\n✓ 参考素材 → {ref_p}  {len(ref)/sr:.1f}s（{len(picked)} 块，自纠剔除 {len(banned)} 块）")
+
+    # ── 交付前的最后一道自检：成品按**绝对阈值**再过一遍 ──
+    # 自纠环已经把不合格的块换掉了，这里再查一次，确保交付的是"自检干净"的版本。
+    final_units = qc_reference(ref_p, sr, a.chunk, model, centroid, period=period)
+    suspects = hard_flags(final_units, has_target=(model is not None and centroid is not None))
+    (out / "qc.json").write_text(json.dumps(suspects, ensure_ascii=False, indent=2), encoding="utf-8")
+    if suspects:
+        print(f"⚠️ 自检：成品里仍有 {len(suspects)} 处不合格（池子里已经换不出更好的了）：")
+        for c in suspects[:12]:
+            print(f"     {c['t']:5.1f}s  相似度{c['sim']:.2f} 平坦度{c['flat']:.3f} "
+                  f"谱峰度{c['crest']:.0f} 峰均比{c['peak']:.1f} 基频{c['voiced']:.2f}"
+                  f"  ← {' / '.join(c['why'])}")
+        print(f"   → 明细 {out/'qc.json'}；这些位置对应**原片**哪一秒见 report.json")
+    else:
+        print("✓ 自检：成品全部通过（声纹、频谱平坦度、谱峰度、峰均比四项都在阈值内）")
+
     print(f"✓ 明细 → {out/'report.json'}（每块的特征值与去留原因，可人工复核）")
     print("  下一步：把这个 wav 拿去克隆音色；如果还有音效，用 report.json 里的 start 定位，"
           "加 --exclude 重跑即可。")
